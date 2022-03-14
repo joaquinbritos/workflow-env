@@ -1,0 +1,262 @@
+---
+name: "CI/CD"
+
+on: 
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Choose the environment:'     
+        required: true
+        default: 'develop'
+        type: choice
+        options: 
+        - develop
+        - staging
+        - production
+
+      deploy:
+        description: 'Go to AWS ECS 🚀'     
+        required: true
+        type: boolean
+
+      release:
+        description: 'Build Release 📷'     
+        required: true
+        type: boolean
+
+      tag:
+        description: 'Re-use an image ♻️:'     
+        required: false
+        type: string  
+
+
+jobs:
+  ci:
+    name: "Tests"
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: "Checkout Code"
+        uses: "actions/checkout@v2"
+
+      - name: "Lint code"
+        run: |
+          echo "Linting repository"
+      - name: "Run unit tests"
+        run: |
+          echo "Running unit tests"
+    
+###########
+## BUILD ##
+###########      
+
+  build:
+    name: "Deployment"
+    permissions:
+      contents: write
+      id-token: write
+    runs-on: ubuntu-latest
+    needs:
+      - ci
+    steps:    
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+# ASSUME AWS ROLE
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@master
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::477575873490:role/github_deploy_role_oidc
+      - run: aws sts get-caller-identity
+
+# GETTING TAGS
+      - name: Get tag from package.json
+        if: github.event.inputs.tag == ''
+        id: get-package-image-version
+        run: |
+          echo "IMAGE_TAG=$(cat package.json | grep version | head -1 | awk -F= "{ print $2 }" | sed 's/[version:,\",]//g' | tr -d '[[:space:]]')" >> $GITHUB_ENV
+          
+      - name: Get TAG from input
+        if: github.event.inputs.tag != ''
+        id: get-input-image-version
+        run: | 
+          echo "IMAGE_TAG=$(github.event.inputs.tag)" >> $GITHUB_ENV
+
+#LOGIN TO ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1   
+
+#CHECK IF IMAGE VERSION EXISTS
+      - name: Check ECR Image
+        id: check-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: terraform-ecr-registry-poc
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        run: ./.github/scripts/check-image.sh
+
+#IF IMAGE VERSION EXISTS, REUSE IT
+      - name: Re-use Existing Docker Image
+        if: env.IMAGE_EXIST == 'true'
+        id: reuse-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: terraform-ecr-registry-poc
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}        
+        run: |
+          echo "IMAGE_EXIST: ${{ env.IMAGE_EXIST }}" 
+          echo " Re use IMAGE: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+      
+# BUILD, TAG and PUSH DOCKER IMAGE TO ECR
+      - name: Build, tag, and push image to Amazon ECR
+        if: env.IMAGE_EXIST  == 'false'
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: terraform-ecr-registry-poc
+          # ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          # IMAGE_TAG: ${{ format('dev-{0}', steps.vars.outputs.tag ) }}
+        run: |
+          echo "IMAGE_EXIST: ${{ env.IMAGE_EXIST }}" 
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo " PUSHED IMAGE: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+
+      - name: Set Image outputs
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: terraform-ecr-registry-poc        
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+        run: |
+          echo "PUSHED IMAGE: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"   
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          
+############
+## DEPLOY ##
+############
+#DOWNLOAD TASK DEFINITION
+
+      - name: Download task definition
+        if: github.event.inputs.deploy == 'true'
+        run: |
+          aws ecs describe-task-definition --task-definition service-${{github.event.inputs.environment}} --query taskDefinition > task-definition.json
+
+#FILL TASK DEFINITION WITH THE CONTAINER IMAGE FROM ECR
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        if: github.event.inputs.deploy == 'true'
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: terraform-application-poc-${{github.event.inputs.environment}}
+          image: ${{ steps.image.outputs.image }}
+
+#DEPLOY THE NEW TASK DEFINITION INTO ECS SERVICE
+
+      - name: Deploy Amazon ECS task definition
+        id: deploy
+        if: github.event.inputs.deploy == 'true'
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: terraform-application-poc-service-${{github.event.inputs.environment}}
+          cluster: terraform-ecs-fargate-poc
+          wait-for-service-stability: 'true'
+
+#############
+## RELEASE ##
+#############
+#IF IT PRODUCTION ENV, CREATE A RELEASE AND A TAG
+      - name: Create Release
+        if: ${{ github.event.inputs.environment == 'production' && github.event.inputs.release == 'true' && steps.deploy.outcome == 'success'}}
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.IMAGE_TAG }}
+          release_name: Release V${{ env.IMAGE_TAG }} 👾
+          prerelease: false
+
+##################
+## NOTIFICATION ##
+##################
+
+#DEPLOYMENT NOTIFICACION TO SLACK CHANNEL
+
+      - name: Send Notification to Slack channel
+        if: always()
+        id: slack
+        uses: slackapi/slack-github-action@v1.18.0
+        with:
+          payload: | 
+                    {
+                      "blocks": [
+                        {
+                          "type": "header",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "New Deployment to: ${{ github.event.inputs.environment }}",
+                            "emoji": true
+                          }
+                        },
+                        {
+                          "type": "divider"
+                        },
+                        {
+                          "type": "section",
+                          "fields": [
+                            {
+                              "type": "mrkdwn",
+                              "text": "*Status:*\n${{ job.status }}"
+                            },
+                            {
+                              "type": "mrkdwn",
+                              "text": "*Service:*\n${{ github.repository }}"
+                            },
+                            {
+                              "type": "mrkdwn",
+                              "text": "*Triggered by:*\n ${{ github.actor }}\t "
+                            },
+                            {
+                              "type": "mrkdwn",
+                              "text": "*Image Version:*\n V${{ env.IMAGE_TAG }}\t "
+                            }
+                          ]
+                        },
+                        {
+                          "type": "divider"
+                        },
+                        {
+                          "type": "section",
+                          "text": {
+                            "type": "mrkdwn",
+                            "text": "<https://github.com/${{ github.repository }}/releases|*Repository Releases*>"
+                          }
+                        },
+                        {
+                          "type": "section",
+                          "text": {
+                            "type": "mrkdwn",
+                            "text": "<https://github.com/${{ github.repository }}|*Repository*>"
+                          }
+                        },
+                        {
+                          "type": "section",
+                          "text": {
+                            "type": "mrkdwn",
+                            "text": "<https://github.com/${{github.repository }}/actions/runs/${{ github.run_id }}|*WorkFlow*>"
+                          }
+                        },
+                        {
+                          "type": "divider"
+                        }
+                      ]
+                    }
+        env:
+          SLACK_WEBHOOK_URL: https://hooks.slack.com/services/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
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK  

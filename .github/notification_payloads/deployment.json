@@ -1,0 +1,63 @@
+{
+    "blocks": [
+      {
+        "type": "header",
+        "text": {
+          "type": "plain_text",
+          "text": "New Deployment to: ${{ github.event.inputs.environment }}",
+          "emoji": true
+        }
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "type": "section",
+        "fields": [
+          {
+            "type": "mrkdwn",
+            "text": "*Status:*\n${{ job.status }}"
+          },
+          {
+            "type": "mrkdwn",
+            "text": "*Service:*\n${{ github.repository }}"
+          },
+          {
+            "type": "mrkdwn",
+            "text": "*Triggered by:*\n ${{ github.actor }}\t "
+          },
+          {
+            "type": "mrkdwn",
+            "text": "*Image Version:*\n V${{ env.IMAGE_TAG }}\t "
+          }
+        ]
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "type": "section",
+        "text": {
+          "type": "mrkdwn",
+          "text": "<https://github.com/${{ github.repository }}/releases|*Repository Releases*>"
+        }
+      },
+      {
+        "type": "section",
+        "text": {
+          "type": "mrkdwn",
+          "text": "<https://github.com/${{ github.repository }}|*Repository*>"
+        }
+      },
+      {
+        "type": "section",
+        "text": {
+          "type": "mrkdwn",
+          "text": "<https://github.com/${{github.repository }}/actions/runs/${{ github.run_id }}|*WorkFlow*>"
+        }
+      },
+      {
+        "type": "divider"
+      }
+    ]
+  }
