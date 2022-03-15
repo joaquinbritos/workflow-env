@@ -51,6 +51,7 @@ jobs:
 
   build:
     name: "Deployment"
+    environment: ${{github.event.inputs.environment}}
     permissions:
       contents: write
       id-token: write
